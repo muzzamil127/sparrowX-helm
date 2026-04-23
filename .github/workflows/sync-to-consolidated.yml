@@ -2,7 +2,7 @@ name: Sync Service Values to Consolidated Helm
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - '*/values.yaml'
 
@@ -48,7 +48,6 @@ jobs:
         with:
           repository: muzzamil127/sparrowX-deploy
           token: ${{ secrets.DEPLOY_REPO_PAT }}
-          ref: main
           path: deploy-consolidated
 
       - name: Set up Python 3.11
