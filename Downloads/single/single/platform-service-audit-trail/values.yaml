@@ -9,7 +9,7 @@ image:
   repository: devopstps/platform-service-audit-trail
   pullPolicy: IfNotPresent
   # Override with image digest or tag at deploy time, e.g. --set image.tag=sha-abc123
-  tag: "v0.0.4"
+  tag: "v0.0.4.4.4"
 
 nameOverride: ""
 fullnameOverride: ""
@@ -23,8 +23,8 @@ imagePullSecrets:
 
 service:
   type: ClusterIP
-  port: 8080
-  healthPort: 8080
+  port: 9000
+  healthPort: 90000
 
 # ---------------------------------------------------------------------------
 # Dapr sidecar injection
