@@ -1,54 +1,20 @@
 #!/usr/bin/env python3
-"""
-sync_values.py
-==============
-Called by the GitHub Actions workflow in sparrowX-deploy.
-
-For each service whose values.yaml changed, this script:
-  1. Reads the git diff
-  2. Extracts the corresponding section from consolidated values.yaml
-  3. Calls the Gemini API to produce JSON patch operations
-  4. Applies those patches safely (preserving YAML anchors and comments)
-  5. Writes the updated consolidated values.yaml back to disk
-
-Environment variables (set by the workflow):
-  GEMINI_API_KEY          – Google Gemini API key
-  CHANGED_SERVICES        – space-separated list of service folder names
-  CONSOLIDATED_VALUES_PATH – path to consolidated values.yaml
-  GITHUB_SHA              – source commit SHA (for logging)
-"""
-
-from __future__ import annotations
-
-import json
-import os
-import re
-import subprocess
-import sys
-import textwrap
-from typing import Optional
-
+import json, os, re, subprocess, sys, textwrap
 import requests
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SERVICE → CONSOLIDATED KEY MAPPING
-# Add an entry here whenever a new service is onboarded.
-# Key   = folder name in sparrowX-deploy
-# Value = top-level YAML key in consolidated values.yaml
-# ─────────────────────────────────────────────────────────────────────────────
-SERVICE_KEY_MAP: dict[str, str] = {
-    "platform-service-audit-trail":         "auditTrail",
-    "platform-service-channel":             "channel",
-    "platform-service-message-store":       "messageStore",
-    "platform-service-user-management":     "userManagement",
-    "platform-service-configuration":       "configuration",
+# Service folder name in sparrowX-helm -> consolidated key in sparrowX-deploy values.yaml
+SERVICE_KEY_MAP = {
+    "platform-service-audit-trail":          "auditTrail",
+    "platform-service-channel":              "channel",
+    "platform-service-message-store":        "messageStore",
+    "platform-service-user-management":      "userManagement",
+    "platform-service-configuration":        "configuration",
     "platform-service-notification-gateway": "notificationGateway",
-    "platform-service-batch":               "batch",
-    "platform-service-host":                "host",
-    "platform-service-lookup":              "lookup",
-    "platform-service-error-management":    "errorManagement",
-    "raast-service-cas":                    "raastServiceCas",
-    # Add more services here as needed
+    "platform-service-batch":                "batch",
+    "platform-service-host":                 "host",
+    "platform-service-lookup":               "lookup",
+    "platform-service-error-management":     "errorManagement",
+    "raast-service-cas":                     "raastServiceCas",
 }
 
 GEMINI_URL = (
@@ -56,285 +22,158 @@ GEMINI_URL = (
     "gemini-1.5-flash-latest:generateContent"
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_git_diff(service_path: str) -> str:
-    """Return the unified diff for <service>/values.yaml between HEAD~1 and HEAD."""
-    result = subprocess.run(
-        ["git", "diff", "HEAD~1", "HEAD", "--", f"{service_path}/values.yaml"],
-        capture_output=True,
-        text=True,
+def get_git_diff(service):
+    r = subprocess.run(
+        ["git", "diff", "HEAD~1", "HEAD", "--", f"{service}/values.yaml"],
+        capture_output=True, text=True
     )
-    return result.stdout.strip()
+    return r.stdout.strip()
 
-
-def read_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as fh:
-        return fh.read()
-
-
-def write_file(path: str, content: str) -> None:
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(content)
-
-
-def extract_section_bounds(content: str, key: str) -> tuple[Optional[int], Optional[int]]:
-    """
-    Return (start_line_idx, end_line_idx) of the top-level YAML section for `key`.
-    end_line_idx points to the line *before* the next top-level key (exclusive).
-    Returns (None, None) if the key is not found.
-    """
-    lines = content.splitlines()
-    start: Optional[int] = None
-
-    for i, line in enumerate(lines):
-        if re.match(rf"^{re.escape(key)}\s*:", line):
-            start = i
-            break
-
-    if start is None:
-        return None, None
-
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        # Next top-level key: non-empty, non-comment, starts with a letter/underscore
-        if line and not line[0].isspace() and line[0] not in ("#", "-"):
-            if re.match(r"^[a-zA-Z_]", line):
-                end = i
-                break
-
-    return start, end
-
-
-def call_gemini(prompt: str, api_key: str) -> str:
-    """Call the Gemini API and return the raw text of the first candidate."""
+def call_gemini(prompt, api_key):
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.05,   # near-deterministic
-            "maxOutputTokens": 4096,
-        },
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": 4096}
     }
-    resp = requests.post(
-        GEMINI_URL,
-        params={"key": api_key},
-        json=payload,
-        timeout=90,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    r = requests.post(GEMINI_URL, params={"key": api_key}, json=payload, timeout=90)
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-
-def extract_json_from_response(text: str) -> list[dict]:
-    """
-    Extract a JSON array from Gemini's response, tolerating markdown code fences.
-    Returns a list of patch objects: [{path, value}, ...]
-    """
-    # Strip markdown fences
-    text = re.sub(r"^```(?:json)?\n?", "", text.strip())
-    text = re.sub(r"\n?```$", "", text.strip())
-    text = text.strip()
-
+def extract_json(text):
+    text = re.sub(r'^```(?:json)?\n?', '', text.strip())
+    text = re.sub(r'\n?```$', '', text.strip()).strip()
     try:
         result = json.loads(text)
-        if isinstance(result, list):
-            return result
-        return []
-    except json.JSONDecodeError:
-        # Try to find a JSON array anywhere in the response
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match:
+        return result if isinstance(result, list) else []
+    except Exception:
+        m = re.search(r'\[.*\]', text, re.DOTALL)
+        if m:
             try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
+                return json.loads(m.group())
+            except Exception:
                 pass
     return []
 
-
-def apply_patch(section_lines: list[str], path: str, new_value: str) -> list[str]:
-    """
-    Apply a single patch to a YAML section (as a list of lines).
-
-    path  – dot-notation relative to the section root, e.g. "image.tag"
-    value – the new scalar value (string representation)
-
-    Only handles simple scalar replacements (string, number, bool).
-    Skips lines that contain YAML anchors (*) to preserve them.
-    """
-    # Build the innermost key from the dot path
-    parts = path.strip(".").split(".")
-    leaf_key = parts[-1]
-
-    # Indentation pattern: find the leaf key in the section
-    # We look for:  <spaces><key>: <old_value>
-    pattern = re.compile(
-        rf"^(\s*{re.escape(leaf_key)}\s*:\s*)(.+)$"
+def section_bounds(content, key):
+    lines = content.splitlines()
+    start = next(
+        (i for i, l in enumerate(lines) if re.match(rf'^{re.escape(key)}\s*:', l)),
+        None
     )
+    if start is None:
+        return None, None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        l = lines[i]
+        if l and not l[0].isspace() and l[0] not in ('#', '-') and re.match(r'^[a-zA-Z_]', l):
+            end = i
+            break
+    return start, end
 
+def apply_patch(section_lines, path, new_value):
+    leaf = path.strip('.').split('.')[-1]
+    pat = re.compile(rf'^(\s*{re.escape(leaf)}\s*:\s*)(.+)$')
     for i, line in enumerate(section_lines):
-        m = pattern.match(line)
+        m = pat.match(line)
         if m:
-            current_value = m.group(2).strip()
-            # Never touch lines referencing a YAML anchor
-            if current_value.startswith("*"):
-                print(f"  Skipping anchor reference: {line.strip()}")
+            cur = m.group(2).strip()
+            if cur.startswith('*'):
+                print(f"  Skipping anchor: {line.strip()}")
                 continue
-            # Quote strings if needed
-            if isinstance(new_value, str) and not re.match(r'^[\d.]+$', new_value) \
-                    and new_value.lower() not in ("true", "false", "null") \
-                    and not new_value.startswith('"'):
-                formatted = f'"{new_value}"'
-            else:
-                formatted = str(new_value)
-            section_lines[i] = m.group(1) + formatted
-            print(f"  Patched [{leaf_key}]: {current_value!r} → {formatted!r}")
+            v = str(new_value)
+            if (not re.match(r'^[\d.]+$', v) and
+                    v.lower() not in ('true', 'false', 'null') and
+                    not v.startswith('"')):
+                v = f'"{v}"'
+            section_lines[i] = m.group(1) + v
+            print(f"  Patched [{leaf}]: {cur!r} -> {v!r}")
             return section_lines
-
-    print(f"  Warning: could not locate key '{leaf_key}' in section — skipping patch.")
+    print(f"  Warning: key '{leaf}' not found in section")
     return section_lines
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    changed_services_str = os.environ.get("CHANGED_SERVICES", "").strip()
-    consolidated_path = os.environ.get(
-        "CONSOLIDATED_VALUES_PATH", "helm-consolidated/CHART/values.yaml"
-    )
+def main():
+    api_key  = os.environ.get("GEMINI_API_KEY", "").strip()
+    services = os.environ.get("CHANGED_SERVICES", "").strip().split()
+    con_path = os.environ.get("CONSOLIDATED_VALUES_PATH", "deploy-consolidated/CHART/values.yaml")
 
     if not api_key:
-        print("ERROR: GEMINI_API_KEY is not set.")
-        sys.exit(1)
-
-    if not changed_services_str:
-        print("No changed services — nothing to do.")
+        sys.exit("ERROR: GEMINI_API_KEY not set")
+    if not services:
         sys.exit(0)
 
-    changed_services = changed_services_str.split()
-    print(f"Services to sync: {changed_services}")
+    content  = open(con_path).read()
+    modified = False
 
-    consolidated_content = read_file(consolidated_path)
-    file_modified = False
-
-    for service in changed_services:
-        print(f"\n{'─' * 60}")
-        print(f"Processing: {service}")
-
-        consolidated_key = SERVICE_KEY_MAP.get(service)
-        if not consolidated_key:
-            print(
-                f"  WARNING: '{service}' is not in SERVICE_KEY_MAP.\n"
-                f"  Add it to .github/scripts/sync_values.py and re-run."
-            )
+    for svc in services:
+        key = SERVICE_KEY_MAP.get(svc)
+        if not key:
+            print(f"WARNING: '{svc}' not in SERVICE_KEY_MAP - skipping")
             continue
 
-        diff = get_git_diff(service)
+        diff = get_git_diff(svc)
         if not diff:
-            print(f"  No diff found — skipping.")
+            print(f"No diff for {svc} - skipping")
             continue
 
-        print(f"  Diff:\n{textwrap.indent(diff, '    ')}")
-
-        try:
-            single_values = read_file(f"{service}/values.yaml")
-        except FileNotFoundError:
-            print(f"  ERROR: {service}/values.yaml not found.")
-            continue
-
-        start, end = extract_section_bounds(consolidated_content, consolidated_key)
+        start, end = section_bounds(content, key)
         if start is None:
-            print(f"  ERROR: Key '{consolidated_key}' not found in consolidated values.yaml.")
+            print(f"ERROR: '{key}' not found in consolidated values.yaml")
             continue
 
-        lines = consolidated_content.splitlines()
-        section_lines = lines[start:end]
-        section_text = "\n".join(section_lines)
+        lines   = content.splitlines()
+        section = "\n".join(lines[start:end])
 
-        # ── Build Gemini prompt ──────────────────────────────────────────────
         prompt = textwrap.dedent(f"""
             You are a Kubernetes Helm expert.
+            A developer changed values.yaml in single-service chart '{svc}'.
+            Sync the relevant changes to consolidated chart key '{key}'.
 
-            A developer changed the `values.yaml` for a single-service Helm chart.
-            Your job is to identify which fields in the consolidated Helm chart need to be updated.
-
-            ## Context
-            - Service folder: `{service}`
-            - Consolidated chart key: `{consolidated_key}`
-
-            ## Git diff (what changed in single service values.yaml)
+            ## Git diff
             ```diff
             {diff}
             ```
 
-            ## Current consolidated section for `{consolidated_key}`
+            ## Current consolidated section for '{key}'
             ```yaml
-            {section_text}
+            {section}
             ```
 
-            ## Instructions
-            1. Analyse every `+` line in the diff (added/changed lines).
-            2. For each changed field, find its **equivalent** inside the consolidated section.
-               Note: field names and structure may differ between the two files (e.g. `replicaCount` in single = `replicas` in consolidated).
-            3. Do NOT sync fields that are intentionally different (e.g. port numbers that differ, environment-specific settings).
-            4. Do NOT modify lines whose value starts with `*` (YAML anchor aliases).
-            5. Return a JSON array of patch operations. Each item must have:
-               - `"path"` – dot-notation path **relative to the `{consolidated_key}` root** (e.g. `"image.tag"`)
-               - `"value"` – the new value as a string
-            6. If there is nothing to sync, return an empty array `[]`.
-            7. Return ONLY the JSON array — no explanation, no markdown, no prose.
+            Rules:
+            - Only sync fields with a clear equivalent in the consolidated section
+            - Never change lines whose value starts with * (YAML anchors)
+            - Do not change intentionally different values (e.g. different ports)
+            - Field names may differ (e.g. replicaCount -> replicas)
 
-            Example output:
-            [
-              {{"path": "image.tag", "value": "v0.0.5"}},
-              {{"path": "replicas", "value": "2"}}
-            ]
+            Return ONLY a JSON array: [{{"path":"image.tag","value":"v0.0.5"}}]
+            Return [] if nothing to sync.
         """).strip()
 
-        print(f"\n  Calling Gemini API...")
+        print(f"\nProcessing {svc} -> {key}")
         try:
-            raw_response = call_gemini(prompt, api_key)
-        except requests.RequestException as exc:
-            print(f"  ERROR: Gemini API call failed: {exc}")
+            resp = call_gemini(prompt, api_key)
+        except Exception as e:
+            print(f"  Gemini error: {e}")
             continue
 
-        print(f"  Gemini response:\n{textwrap.indent(raw_response, '    ')}")
-
-        patches = extract_json_from_response(raw_response)
+        patches = extract_json(resp)
         if not patches:
-            print(f"  Gemini returned no patches — no changes needed for {service}.")
+            print("  No patches needed")
             continue
 
-        print(f"  Applying {len(patches)} patch(es)...")
-        for patch in patches:
-            path = patch.get("path", "")
-            value = patch.get("value", "")
-            if not path:
-                continue
-            section_lines = apply_patch(list(section_lines), path, str(value))
+        sec_lines = lines[start:end]
+        for p in patches:
+            sec_lines = apply_patch(list(sec_lines), p.get("path", ""), str(p.get("value", "")))
 
-        # Rebuild the full file content
-        new_lines = lines[:start] + section_lines + lines[end:]
-        consolidated_content = "\n".join(new_lines)
-        if not consolidated_content.endswith("\n"):
-            consolidated_content += "\n"
-        file_modified = True
-        print(f"  Sync complete for: {service}")
+        lines   = lines[:start] + sec_lines + lines[end:]
+        content = "\n".join(lines)
+        if not content.endswith("\n"):
+            content += "\n"
+        modified = True
 
-    if file_modified:
-        write_file(consolidated_path, consolidated_content)
-        print(f"\n{'═' * 60}")
-        print(f"consolidated values.yaml updated: {consolidated_path}")
+    if modified:
+        open(con_path, "w").write(content)
+        print(f"\nUpdated: {con_path}")
     else:
-        print(f"\nNo changes written — consolidated values.yaml is unchanged.")
-
+        print("\nNo changes written.")
 
 if __name__ == "__main__":
     main()
