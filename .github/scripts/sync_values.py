@@ -30,12 +30,19 @@ def get_git_diff(service):
     return r.stdout.strip()
 
 def call_gemini(prompt, api_key):
+    import time
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.05, "maxOutputTokens": 4096}
     }
-    r = requests.post(GEMINI_URL, params={"key": api_key}, json=payload, timeout=90)
-    r.raise_for_status()
+    for attempt in range(3):
+        r = requests.post(GEMINI_URL, params={"key": api_key}, json=payload, timeout=90)
+        if r.status_code == 429:
+            wait = 30 * (attempt + 1)
+            print(f"  Rate limited, retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
     return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 def extract_json(text):
