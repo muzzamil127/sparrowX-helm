@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "platform-service-audit-trail.fullname" . }}
+  labels:
+    {{- include "platform-service-audit-trail.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "platform-service-audit-trail.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "platform-service-audit-trail.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- if .Values.dapr.enabled }}
+        dapr.io/enabled: "true"
+        dapr.io/app-id: {{ .Values.dapr.appId | quote }}
+        dapr.io/app-port: {{ .Values.dapr.appPort | quote }}
+        dapr.io/sidecar-http-port: {{ .Values.dapr.sidecarHttpPort | quote }}
+        dapr.io/sidecar-grpc-port: {{ .Values.dapr.sidecarGrpcPort | quote }}
+        dapr.io/log-level: {{ .Values.dapr.logLevel | quote }}
+        dapr.io/enable-api-logging: {{ .Values.dapr.enableApiLogging | quote }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            {{- if ne (int .Values.service.healthPort) (int .Values.service.port) }}
+            - name: health
+              containerPort: {{ .Values.service.healthPort }}
+              protocol: TCP
+            {{- end }}
+          # Service ConfigMap first — its values take precedence over infra ConfigMap
+          # for any overlapping keys.
+          envFrom:
+            - configMapRef:
+                name: {{ include "platform-service-audit-trail.fullname" . }}-config
+            - configMapRef:
+                name: {{ .Values.infraConfigMap.name }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: {{ .Values.service.healthPort }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: {{ .Values.service.healthPort }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.logs.enabled }}
+          volumeMounts:
+            - name: app-logs
+              mountPath: {{ .Values.logs.mountPath }}
+          {{- end }}
+      {{- if .Values.logs.enabled }}
+      volumes:
+        - name: app-logs
+          emptyDir: {}
+      {{- end }}
