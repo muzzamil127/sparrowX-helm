@@ -35,15 +35,18 @@ def call_gemini(prompt, api_key):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.05, "maxOutputTokens": 4096}
     }
-    for attempt in range(3):
+    for attempt in range(4):
         r = requests.post(GEMINI_URL, params={"key": api_key}, json=payload, timeout=90)
         if r.status_code == 429:
             wait = 30 * (attempt + 1)
-            print(f"  Rate limited, retrying in {wait}s...")
+            print(f"  Rate limited (attempt {attempt+1}/4), retrying in {wait}s...")
             time.sleep(wait)
             continue
         r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        data = r.json()
+        print(f"  Gemini raw response: {str(data)[:300]}")
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    raise Exception("Gemini rate limit exceeded after 4 retries")
 
 def extract_json(text):
     text = re.sub(r'^```(?:json)?\n?', '', text.strip())
