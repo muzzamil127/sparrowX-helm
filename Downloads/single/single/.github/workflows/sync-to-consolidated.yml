@@ -48,6 +48,7 @@ jobs:
         with:
           repository: muzzamil127/sparrowX-helm
           token: ${{ secrets.HELM_REPO_PAT }}
+          ref: master
           path: helm-consolidated
 
       - name: Set up Python 3.11
@@ -118,7 +119,7 @@ jobs:
 
           gh pr create \
             --repo muzzamil127/sparrowX-helm \
-            --base main \
+            --base master \
             --head "$BRANCH" \
             --title "chore: auto-sync Helm values for $SERVICES" \
             --body-file /tmp/pr-body.md
