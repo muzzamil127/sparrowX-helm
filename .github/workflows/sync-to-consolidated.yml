@@ -6,9 +6,12 @@ on:
     paths:
       - '*/values.yaml'
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # silence Node.js 20 deprecation warnings
+
 jobs:
   sync:
-    name: Detect, Sync, and PR
+    name: Detect → AI Sync → PR
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -16,7 +19,7 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout sparrowX-helm (this repo) with depth=2 so HEAD~1 exists
+      # 1. Checkout sparrowX-helm (this repo) — depth=2 so HEAD~1 exists for diff
       # -----------------------------------------------------------------------
       - name: Checkout sparrowX-helm
         uses: actions/checkout@v4
@@ -24,7 +27,7 @@ jobs:
           fetch-depth: 2
 
       # -----------------------------------------------------------------------
-      # 2. Detect which service values.yaml files changed
+      # 2. Find which service values.yaml files were touched in this push
       # -----------------------------------------------------------------------
       - name: Detect changed services
         id: detect
@@ -43,14 +46,14 @@ jobs:
 
           if [[ -z "$SERVICES" ]]; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "No service values.yaml changes detected."
+            echo "No service values.yaml changes detected — workflow done."
           else
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "Detected changed services: $SERVICES"
           fi
 
       # -----------------------------------------------------------------------
-      # 3. Checkout sparrowX-deploy (the consolidated chart repo)
+      # 3. Checkout sparrowX-deploy (consolidated chart repo) via PAT
       # -----------------------------------------------------------------------
       - name: Checkout sparrowX-deploy
         if: steps.detect.outputs.has_changes == 'true'
@@ -62,7 +65,7 @@ jobs:
           path: deploy-consolidated
 
       # -----------------------------------------------------------------------
-      # 4. Python + pip
+      # 4. Python env
       # -----------------------------------------------------------------------
       - name: Set up Python 3.11
         if: steps.detect.outputs.has_changes == 'true'
@@ -70,17 +73,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         if: steps.detect.outputs.has_changes == 'true'
         run: pip install --quiet requests pyyaml
 
       # -----------------------------------------------------------------------
-      # 5. Run the sync script
-      #    Primary: deterministic YAML-diff (no API needed, always works)
-      #    Optional: Gemini for unmapped fields when GEMINI_API_KEY is set
-      #    continue-on-error keeps the diff-check running even on unexpected crash
+      # 5. AI-powered sync
+      #    - Gemini detects which fields to update and maps them intelligently
+      #    - Deterministic fallback runs if Gemini is rate-limited or unavailable
+      #    - continue-on-error: true so diff-check always runs even on crash
       # -----------------------------------------------------------------------
-      - name: Run sync script
+      - name: AI sync (Gemini + deterministic fallback)
         if: steps.detect.outputs.has_changes == 'true'
         id: sync_script
         continue-on-error: true
@@ -91,16 +94,16 @@ jobs:
         run: python .github/scripts/sync_values.py
 
       # -----------------------------------------------------------------------
-      # 6. Check whether the consolidated values.yaml was actually changed
+      # 6. Check if the consolidated chart was actually modified
       # -----------------------------------------------------------------------
-      - name: Check for diff in consolidated chart
+      - name: Check consolidated chart for changes
         if: steps.detect.outputs.has_changes == 'true'
         id: deploy_diff
         run: |
           cd deploy-consolidated
           if git diff --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "Consolidated values.yaml is unchanged -- no PR needed."
+            echo "Consolidated values.yaml unchanged — no PR needed."
           else
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "Changes detected in consolidated chart:"
@@ -108,7 +111,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 7. Commit, push, and open a PR in sparrowX-deploy
+      # 7. Commit + push + open PR in sparrowX-deploy
       # -----------------------------------------------------------------------
       - name: Create PR in sparrowX-deploy
         if: >
@@ -131,8 +134,9 @@ jobs:
           git add CHART/values.yaml
           git commit -m "chore: auto-sync Helm values from sparrowX-helm
 
-          Services: ${SERVICES}
-          Source commit: ${{ github.sha }}"
+          Services : ${SERVICES}
+          Commit   : ${{ github.sha }}
+          Actor    : ${{ github.actor }}"
           git push origin "$BRANCH"
 
           gh pr create \
@@ -142,30 +146,34 @@ jobs:
             --title "chore: auto-sync Helm values for ${SERVICES}" \
             --body "## Automated Helm Values Sync
 
-          Auto-generated by the **sync-to-consolidated** workflow in sparrowX-helm.
+          Auto-generated by the **sync-to-consolidated** workflow in [sparrowX-helm](https://github.com/muzzamil127/sparrowX-helm).
 
-          ### What happened
-          1. A developer pushed a change to \`values.yaml\` in **sparrowX-helm**.
-          2. The sync script detected changed fields via YAML diff (deterministic, no AI required).
-          3. Common fields (image.tag, replicas, resources) were synced automatically.
-          4. YAML anchors and comments are preserved.
+          ### How it works
+          1. A developer pushed a change to \`values.yaml\` in sparrowX-helm.
+          2. The sync script loads the old and new values via \`git show\` and diffs them.
+          3. **Gemini AI** decides which changed fields map to the consolidated chart and how.
+          4. If Gemini is unavailable, a deterministic fallback applies exact-name matches.
+          5. YAML comments and anchor aliases (\`*ref\`) are always preserved.
 
-          > Please review the diff carefully before merging.
+          > **Please review the diff carefully before merging.**
 
           ---
           **Services updated:** \`${SERVICES}\`
-          **Source commit:** ${{ github.sha }}
-          **Triggered by:** ${{ github.actor }}"
+          **Source commit:** [\`${{ github.sha }}\`](https://github.com/muzzamil127/sparrowX-helm/commit/${{ github.sha }})
+          **Triggered by:** @${{ github.actor }}"
 
-          echo "PR created successfully for branch: $BRANCH"
+          echo "PR created on branch: $BRANCH"
 
       # -----------------------------------------------------------------------
-      # 8. Surface the sync-script outcome as a clear summary
+      # 8. Summary (always printed, even on failure)
       # -----------------------------------------------------------------------
-      - name: Report sync result
+      - name: Sync summary
         if: always()
         run: |
-          echo "=== Sync Summary ==="
-          echo "Changed services  : ${{ steps.detect.outputs.services }}"
-          echo "Sync script result: ${{ steps.sync_script.outcome }}"
-          echo "Consolidated diff : ${{ steps.deploy_diff.outputs.has_changes }}"
+          echo "=================================="
+          echo "  Sync Summary"
+          echo "=================================="
+          echo "  Changed services  : ${{ steps.detect.outputs.services }}"
+          echo "  Sync script result: ${{ steps.sync_script.outcome }}"
+          echo "  Consolidated diff : ${{ steps.deploy_diff.outputs.has_changes }}"
+          echo "=================================="
