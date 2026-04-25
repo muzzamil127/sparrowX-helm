@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-sync_values.py — AI-powered Helm values sync (Gemini primary, deterministic fallback)
-
-Flow for each changed service:
-  1. Load values.yaml at HEAD~1 and HEAD via `git show`  -> compute ALL changed fields
-  2. Gemini receives the changed fields + consolidated section for that service
-     and returns exact JSON patches to apply  (primary path)
-  3. If Gemini is unavailable/rate-limited, a deterministic fallback applies
-     fields whose names match directly or exist in FIELD_REMAP  (fallback path)
-  4. Patches are applied at the text level so YAML comments/anchors are preserved
-  5. The consolidated values.yaml is written; the workflow diff-check and PR step
-     decide whether anything changed and whether a PR is needed
-
-Gemini rate-limit strategy:
-  - Prompts are minimal (only changed fields + the relevant section, not full file)
-  - Respects Retry-After header on 429 responses
-  - Up to MAX_RETRIES attempts with capped exponential back-off
-  - On final failure the deterministic fallback still runs, so the sync is never
-    completely blocked by API quota issues
+sync_values.py
+--------------
+1. Load old/new service values.yaml via git show -> compute every changed field
+2. Call Gemini AI with a focused prompt -> it returns exact JSON patches
+3. If Gemini fails (rate-limit/unavailable) -> deterministic fallback for
+   known safe field mappings (replicaCount, image.tag, resources, autoscaling)
+4. Apply patches at text level (preserves YAML comments and anchor aliases)
+5. Write consolidated values.yaml; workflow diff-check handles the PR
 """
 
 import json
@@ -27,15 +17,14 @@ import subprocess
 import sys
 import textwrap
 import time
-from typing import Any
 
 import requests
 import yaml
 
 # ---------------------------------------------------------------------------
-# Repo mapping
+# Service folder  ->  consolidated section key
 # ---------------------------------------------------------------------------
-SERVICE_KEY_MAP: dict[str, str] = {
+SERVICE_KEY_MAP = {
     "platform-service-audit-trail":          "auditTrail",
     "platform-service-channel":              "channel",
     "platform-service-message-store":        "messageStore",
@@ -49,164 +38,43 @@ SERVICE_KEY_MAP: dict[str, str] = {
     "raast-service-cas":                     "raastServiceCas",
 }
 
-# Deterministic fallback: service field name -> consolidated field name (when different)
-FIELD_REMAP: dict[str, str] = {
-    "replicaCount": "replicas",
-    "appPort":      "appPort",   # dapr
-    "appId":        "appId",
+# Explicit safe mappings: service flat-path -> (context_keyword, consolidated_leaf)
+# context_keyword: the line immediately above the leaf (e.g. "requests", "limits")
+#                  or "" to match the first occurrence anywhere in the section
+FIELD_SYNC_MAP = {
+    "replicaCount":                               ("",         "replicas"),
+    "image.tag":                                  ("image",    "tag"),
+    "image.repository":                           ("image",    "repository"),
+    "image.pullPolicy":                           ("image",    "pullPolicy"),
+    "resources.requests.memory":                  ("requests", "memory"),
+    "resources.requests.cpu":                     ("requests", "cpu"),
+    "resources.limits.memory":                    ("limits",   "memory"),
+    "resources.limits.cpu":                       ("limits",   "cpu"),
+    "autoscaling.enabled":                        ("autoscaling", "enabled"),
+    "autoscaling.minReplicas":                    ("autoscaling", "minReplicas"),
+    "autoscaling.maxReplicas":                    ("autoscaling", "maxReplicas"),
+    "autoscaling.targetCPUUtilizationPercentage": ("autoscaling", "targetCPUUtilizationPercentage"),
+    "autoscaling.targetMemoryUtilizationPercentage": ("autoscaling", "targetMemoryUtilizationPercentage"),
 }
-
-# ---------------------------------------------------------------------------
-# Gemini config
-# ---------------------------------------------------------------------------
-GEMINI_MODEL   = "gemini-2.0-flash"
-GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
-MAX_RETRIES    = 5
-BASE_BACKOFF   = 15   # seconds
-MAX_BACKOFF    = 90   # cap
-
-
-# ---------------------------------------------------------------------------
-# YAML helpers
-# ---------------------------------------------------------------------------
-
-def flatten_dict(d: dict, prefix: str = "") -> dict:
-    """Recursively flatten nested dict to {dot.notation.key: value}."""
-    out: dict = {}
-    for k, v in d.items():
-        key = f"{prefix}.{k}" if prefix else str(k)
-        if isinstance(v, dict):
-            out.update(flatten_dict(v, key))
-        elif isinstance(v, list):
-            # Store lists as JSON strings so they compare cleanly
-            out[key] = json.dumps(v, default=str)
-        else:
-            out[key] = v
-    return out
-
-
-def load_yaml_at(service: str, ref: str) -> dict:
-    """Parse values.yaml for <service> at git <ref>. Returns {} on any error."""
-    result = subprocess.run(
-        ["git", "show", f"{ref}:{service}/values.yaml"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return {}
-    try:
-        return yaml.safe_load(result.stdout) or {}
-    except yaml.YAMLError as exc:
-        print(f"  [yaml] Parse error at {ref}: {exc}")
-        return {}
-
-
-def compute_all_changes(service: str) -> dict:
-    """
-    Return {flat_key: new_value} for EVERY field that changed between
-    HEAD~1 and HEAD in <service>/values.yaml. No filter applied here.
-    """
-    old = load_yaml_at(service, "HEAD~1")
-    new = load_yaml_at(service, "HEAD")
-
-    if not new:
-        print(f"  [diff] Cannot load {service}/values.yaml at HEAD — skipping")
-        return {}
-
-    old_flat = flatten_dict(old) if old else {}
-    new_flat  = flatten_dict(new)
-
-    return {k: v for k, v in new_flat.items() if old_flat.get(k) != v}
-
-
-# ---------------------------------------------------------------------------
-# Text-level patching (preserves YAML comments and anchors)
-# ---------------------------------------------------------------------------
-
-def detect_line_ending(content: str) -> str:
-    """Return '\\r\\n' if content uses CRLF, else '\\n'."""
-    return "\r\n" if "\r\n" in content else "\n"
-
-
-def section_bounds(lines: list[str], key: str) -> tuple[int | None, int]:
-    """
-    Return (start, end) line indices of the top-level YAML block '<key>:'.
-    end is exclusive. Returns (None, 0) if not found.
-    """
-    start = next(
-        (i for i, line in enumerate(lines)
-         if re.match(rf"^{re.escape(key)}\s*:", line)),
-        None,
-    )
-    if start is None:
-        return None, 0
-
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        ln = lines[i]
-        if (
-            ln
-            and not ln[0].isspace()
-            and ln[0] not in ("#", "-")
-            and re.match(r"^[a-zA-Z_]", ln)
-        ):
-            end = i
-            break
-    return start, end
-
-
-def patch_section(sec_lines: list[str], leaf: str, new_value: Any) -> bool:
-    """
-    Find the FIRST line in sec_lines matching '<leaf>: <anything>' and update it.
-    - Skips lines whose current value starts with * (YAML anchor alias).
-    - Quotes string values that aren't plain scalars.
-    Returns True if a line was patched.
-    """
-    pat = re.compile(rf"^(\s*{re.escape(leaf)}\s*:\s*)(.+)$")
-
-    for i, line in enumerate(sec_lines):
-        m = pat.match(line)
-        if not m:
-            continue
-        cur = m.group(2).strip()
-        if cur.startswith("*"):
-            print(f"  [patch] Skipping anchor: {line.strip()!r}")
-            continue
-
-        v = str(new_value).strip()
-        is_plain = bool(re.match(r"^-?[\d.]+$", v)) or v.lower() in ("true", "false", "null")
-        already_quoted = v.startswith(('"', "'"))
-        if not (is_plain or already_quoted):
-            v = f'"{v}"'
-
-        sec_lines[i] = m.group(1) + v
-        print(f"  [patch] {leaf}: {cur!r} -> {v!r}")
-        return True
-
-    print(f"  [patch] Key '{leaf}' not found in section — skipped")
-    return False
-
 
 # ---------------------------------------------------------------------------
 # Gemini
 # ---------------------------------------------------------------------------
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL   = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+MAX_RETRIES  = 3
+BASE_BACKOFF = 10   # keep retries short so fallback runs quickly on rate-limit
+
 
 def call_gemini(prompt: str, api_key: str) -> str:
-    """
-    Call Gemini with exponential back-off on 429/5xx/timeout.
-    Returns the model's text. Raises RuntimeError after all retries.
-    """
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature":     0.05,
-            "maxOutputTokens": 2048,
-        },
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": 2048},
     }
-    last_err: Exception | None = None
-
+    last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(
@@ -215,228 +83,292 @@ def call_gemini(prompt: str, api_key: str) -> str:
                 json=payload,
                 timeout=60,
             )
-
             if resp.status_code == 429:
-                # Honour Retry-After when present; otherwise use backoff
-                retry_after = resp.headers.get("Retry-After")
+                retry_after = resp.headers.get("Retry-After", "")
                 wait = min(
-                    int(retry_after) if retry_after and retry_after.isdigit()
-                    else BASE_BACKOFF * (2 ** (attempt - 1)),
-                    MAX_BACKOFF,
+                    int(retry_after) if retry_after.isdigit() else BASE_BACKOFF * attempt,
+                    60,
                 )
-                print(f"  [gemini] 429 rate-limit (attempt {attempt}/{MAX_RETRIES}) — waiting {wait}s")
+                print(f"  [gemini] 429 (attempt {attempt}/{MAX_RETRIES}) — wait {wait}s")
                 time.sleep(wait)
-                last_err = Exception("429 rate-limit")
+                last_err = Exception("429")
                 continue
-
             if resp.status_code in (500, 502, 503, 504):
-                wait = min(BASE_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
-                print(f"  [gemini] HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}) — waiting {wait}s")
+                wait = BASE_BACKOFF * attempt
+                print(f"  [gemini] HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}) — wait {wait}s")
                 time.sleep(wait)
                 last_err = Exception(f"HTTP {resp.status_code}")
                 continue
-
             resp.raise_for_status()
-
             data       = resp.json()
             candidates = data.get("candidates") or []
             if not candidates:
-                block = data.get("promptFeedback", {}).get("blockReason", "unknown")
-                raise ValueError(f"No candidates (blockReason={block})")
-
+                raise ValueError("No candidates returned by Gemini")
             text = (
-                candidates[0]
-                .get("content", {})
+                candidates[0].get("content", {})
                 .get("parts", [{}])[0]
-                .get("text", "")
-                .strip()
+                .get("text", "").strip()
             )
-            print(f"  [gemini] OK (attempt {attempt}) — {len(text)} chars, preview: {text[:100]!r}")
+            print(f"  [gemini] OK (attempt {attempt})")
             return text
-
         except requests.exceptions.Timeout:
-            last_err = TimeoutError("Gemini request timed out")
             print(f"  [gemini] Timeout (attempt {attempt}/{MAX_RETRIES})")
-
+            last_err = TimeoutError()
         except requests.exceptions.RequestException as exc:
+            print(f"  [gemini] Network error: {exc}")
             last_err = exc
-            print(f"  [gemini] Network error (attempt {attempt}/{MAX_RETRIES}): {exc}")
-
         except ValueError:
-            raise  # non-retryable
-
+            raise
     raise RuntimeError(f"Gemini failed after {MAX_RETRIES} attempts: {last_err}")
 
 
-def extract_json_list(text: str) -> list:
-    """Extract a JSON array from model text (handles markdown fences)."""
-    # Strip fences
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.MULTILINE)
-    text = re.sub(r"\s*```$",          "", text.strip(), flags=re.MULTILINE).strip()
-
+def parse_json_list(text: str) -> list:
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*```$",          "", text, flags=re.MULTILINE).strip()
     try:
         result = json.loads(text)
         return result if isinstance(result, list) else []
     except json.JSONDecodeError:
         pass
-
-    # Fall back: first [...] block in the response
     m = re.search(r"\[.*?\]", text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group())
         except json.JSONDecodeError:
             pass
-
     return []
 
 
-def gemini_patches(
-    svc: str, key: str, changes: dict, section_text: str, api_key: str
-) -> list[dict]:
-    """
-    Ask Gemini which fields to sync and exactly how.
-    Returns a list of {"path": "dotted.key", "value": "new_value"} dicts.
-    """
-    changes_yaml = "\n".join(f"  {k}: {v!r}" for k, v in changes.items())
+# ---------------------------------------------------------------------------
+# YAML diff helpers
+# ---------------------------------------------------------------------------
 
-    prompt = textwrap.dedent(f"""
-        You are a Kubernetes Helm expert performing a values sync.
+def flatten(d: dict, prefix: str = "") -> dict:
+    out: dict = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(flatten(v, key))
+        elif isinstance(v, list):
+            out[key] = v   # store as-is; compare with ==
+        else:
+            out[key] = v
+    return out
 
-        A developer changed these fields in the individual service chart '{svc}':
-        ```
-        {changes_yaml}
-        ```
 
-        The consolidated Helm chart uses a unified values.yaml.
-        Below is the current YAML section for '{key}' in that file:
-        ```yaml
-        {section_text}
-        ```
+def load_yaml(service: str, ref: str) -> dict:
+    r = subprocess.run(
+        ["git", "show", f"{ref}:{service}/values.yaml"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return {}
+    try:
+        return yaml.safe_load(r.stdout) or {}
+    except yaml.YAMLError:
+        return {}
 
-        Your job: decide which of the changed fields should be mirrored into the
-        consolidated section, find the correct key path, and return the new value.
 
-        Rules (strictly follow all):
-        1. Only sync a field if there is a clear, unambiguous corresponding key in the
-           consolidated section. When field NAMES differ (e.g. replicaCount vs replicas,
-           service.port vs service.ports[].port), map them intelligently.
-        2. NEVER touch any key whose current value starts with * — those are YAML anchor
-           aliases and must remain untouched.
-        3. Do NOT sync values that are intentionally different between the two charts
-           (e.g. different namespaces, health-check paths, Dapr internal ports).
-        4. For array fields (like service.ports), update only the scalar leaf that
-           best matches the changed value (e.g. the `port` key inside the first entry).
-        5. Return ONLY a JSON array — no prose, no markdown fences:
-           [{{"path": "leaf_key", "value": "new_value"}}]
-           Use the LEAF key name as it appears in the consolidated section, not the
-           full dotted path.
-        6. If nothing should be synced, return exactly: []
-    """).strip()
-
-    raw     = call_gemini(prompt, api_key)
-    patches = extract_json_list(raw)
-    print(f"  [gemini] Suggested patches: {patches}")
-    return patches
+def changed_fields(service: str) -> dict:
+    """Return {flat_key: new_value} for every field that changed HEAD~1->HEAD."""
+    old = flatten(load_yaml(service, "HEAD~1"))
+    new = flatten(load_yaml(service, "HEAD"))
+    if not new:
+        return {}
+    result = {k: v for k, v in new.items() if old.get(k) != v}
+    print(f"  [diff] Changed fields ({len(result)}): {sorted(result.keys())}")
+    print(f"  [diff] Values: { {k: result[k] for k in sorted(result.keys())} }")
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Deterministic fallback (no API)
+# Text-level patching
 # ---------------------------------------------------------------------------
 
-def deterministic_patches(changes: dict, sec_lines: list[str]) -> list[dict]:
+def read_file(path: str) -> tuple[str, str]:
+    """Read file preserving exact line endings. Returns (content, eol)."""
+    with open(path, encoding="utf-8", newline="") as f:
+        raw = f.read()
+    eol = "\r\n" if "\r\n" in raw else "\n"
+    return raw, eol
+
+
+def write_file(path: str, content: str) -> None:
+    """Write file without any newline translation."""
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+
+def section_lines(content: str, eol: str, key: str) -> tuple[int | None, int, list[str]]:
     """
-    For each changed field, try an exact leaf-name match in the section.
-    Also applies FIELD_REMAP for known renames.
-    Returns patches in the same format as gemini_patches.
+    Split content by eol, find the top-level YAML block for <key>.
+    Returns (start_idx, end_idx, all_lines).
     """
-    section_keys: set[str] = set()
-    key_pat = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:")
-    for line in sec_lines:
-        m = key_pat.match(line)
-        if m:
-            section_keys.add(m.group(1))
-
-    patches = []
-    for flat_key, new_val in changes.items():
-        leaf = flat_key.split(".")[-1]
-        # Try remapped name first, then leaf name
-        for candidate in [FIELD_REMAP.get(leaf), leaf]:
-            if candidate and candidate in section_keys:
-                patches.append({"path": candidate, "value": str(new_val)})
-                break
-    return patches
-
-
-# ---------------------------------------------------------------------------
-# Per-service entry point
-# ---------------------------------------------------------------------------
-
-def sync_service(
-    svc: str, key: str, content: str, eol: str, api_key: str
-) -> tuple[str, bool]:
-    """
-    Apply all relevant patches for one service to `content`.
-    Returns (updated_content, was_modified).
-    """
-    print(f"\n{'='*62}")
-    print(f"Service  : {svc}")
-    print(f"Cons. key: {key}")
-    print(f"{'='*62}")
-
-    changes = compute_all_changes(svc)
-    if not changes:
-        print("  No field changes detected — nothing to sync")
-        return content, False
-
-    print(f"  Detected {len(changes)} changed field(s): {sorted(changes)}")
-
-    lines = content.split(eol)   # split on exact line ending to preserve it
-    start, end = section_bounds(lines, key)
+    lines = content.split(eol)
+    start = next(
+        (i for i, ln in enumerate(lines) if re.match(rf"^{re.escape(key)}\s*:", ln)),
+        None,
+    )
     if start is None:
-        print(f"  ERROR: section '{key}' not found in consolidated values.yaml")
+        return None, 0, lines
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if ln and not ln[0].isspace() and ln[0] not in ("#", "-") and re.match(r"^[a-zA-Z_]", ln):
+            end = i
+            break
+    return start, end, lines
+
+
+def patch_leaf(sec: list[str], context: str, leaf: str, value: str) -> bool:
+    """
+    Find `leaf:` inside sec, optionally requiring `context:` to appear
+    somewhere above it in the same indented block. Skips anchor aliases (*).
+    Returns True if patched.
+    """
+    leaf_pat = re.compile(rf"^(\s*{re.escape(leaf)}\s*:\s*)(.+)$")
+
+    # Build candidate line indices where the leaf matches
+    candidates = [i for i, ln in enumerate(sec) if leaf_pat.match(ln)]
+    if not candidates:
+        print(f"  [patch] '{leaf}' not found in section — skipped")
+        return False
+
+    chosen = candidates[0]   # default: first occurrence
+
+    if context:
+        # Find the candidate that is preceded (somewhere above, within indented block)
+        # by a line matching the context keyword
+        ctx_pat = re.compile(rf"^\s*{re.escape(context)}\s*:")
+        for ci in candidates:
+            # Walk backward from ci to find context within the same block
+            indent = len(sec[ci]) - len(sec[ci].lstrip())
+            for j in range(ci - 1, -1, -1):
+                ln = sec[j]
+                if not ln.strip() or ln.strip().startswith("#"):
+                    continue
+                ln_indent = len(ln) - len(ln.lstrip())
+                if ln_indent < indent and ctx_pat.match(ln):
+                    chosen = ci
+                    break
+                if ln_indent < indent:
+                    break   # left the block without finding context
+
+    m = leaf_pat.match(sec[chosen])
+    cur = m.group(2).strip()
+    if cur.startswith("*"):
+        print(f"  [patch] Skipping anchor alias: {sec[chosen].strip()!r}")
+        return False
+
+    # Format the value correctly
+    is_plain = bool(re.match(r"^-?[\d.]+$", value)) or value.lower() in ("true", "false", "null")
+    already_quoted = value.startswith(('"', "'"))
+    v = value if (is_plain or already_quoted) else f'"{value}"'
+
+    sec[chosen] = m.group(1) + v
+    print(f"  [patch] {leaf}: {cur!r} -> {v!r}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Sync one service
+# ---------------------------------------------------------------------------
+
+def sync_service(svc: str, con_key: str, content: str, eol: str, api_key: str) -> tuple[str, bool]:
+    print(f"\n{'='*60}")
+    print(f"Service  : {svc}")
+    print(f"Chart key: {con_key}")
+    print(f"{'='*60}")
+
+    changes = changed_fields(svc)
+    if not changes:
+        print("  No changes — skipping")
         return content, False
 
-    sec_lines = list(lines[start:end])
-    section_text = "\n".join(sec_lines)
+    start, end, lines = section_lines(content, eol, con_key)
+    if start is None:
+        print(f"  ERROR: '{con_key}' block not found in consolidated values.yaml")
+        return content, False
+
+    sec = list(lines[start:end])
+    section_text = "\n".join(sec)
     modified = False
 
     # ------------------------------------------------------------------
-    # 1. Primary path: Gemini decides what to sync and how
+    # Path 1 — Gemini: send ALL changed fields, let AI decide what to sync
     # ------------------------------------------------------------------
-    patches: list[dict] = []
+    ai_patches: list[dict] = []
     if api_key:
+        changes_text = "\n".join(f"  {k}: {v!r}" for k, v in sorted(changes.items()))
+        prompt = textwrap.dedent(f"""
+            You are a Kubernetes Helm expert performing a values sync.
+
+            Service chart changed ({svc}):
+            {changes_text}
+
+            Consolidated section '{con_key}' (current state):
+            ```yaml
+            {section_text}
+            ```
+
+            Task: determine which changed fields should be mirrored into the
+            consolidated section and return the exact patches.
+
+            Rules (strictly follow all):
+            1. Only sync a field if the consolidated section has a clearly
+               corresponding key (even if the name differs, e.g. replicaCount
+               vs replicas, service.port vs the port inside service.ports[]).
+            2. NEVER touch a key whose current value starts with * (YAML anchor).
+            3. Do NOT sync values that are intentionally different (health ports,
+               namespaces, Dapr internal ports, etc.).
+            4. Return ONLY a JSON array — no prose, no markdown:
+               [{{"path": "leaf_key_as_in_consolidated", "value": "new_value"}}]
+               Use the leaf key name exactly as it appears in the consolidated section.
+            5. If nothing should change, return exactly: []
+        """).strip()
+
         try:
-            patches = gemini_patches(svc, key, changes, section_text, api_key)
+            raw = call_gemini(prompt, api_key)
+            ai_patches = parse_json_list(raw)
+            print(f"  [gemini] patches: {ai_patches}")
         except Exception as exc:
-            print(f"  [gemini] Unavailable — falling back to deterministic: {exc}")
+            print(f"  [gemini] unavailable — using deterministic fallback: {exc}")
 
     # ------------------------------------------------------------------
-    # 2. Fallback path: deterministic exact-name matching
-    #    Also runs when Gemini returned nothing (empty patches)
+    # Path 2 — Deterministic fallback (explicit safe field map, no ambiguity)
     # ------------------------------------------------------------------
-    if not patches:
-        print("  [fallback] Running deterministic field matching")
-        patches = deterministic_patches(changes, sec_lines)
-        print(f"  [fallback] Patches: {patches}")
+    if not ai_patches:
+        print("  [fallback] Applying deterministic field map")
+        for flat_key, new_val in changes.items():
+            mapping = FIELD_SYNC_MAP.get(flat_key)
+            if mapping is None:
+                print(f"  [fallback] '{flat_key}' not in FIELD_SYNC_MAP — skipped")
+                continue
+            context, leaf = mapping
+            ai_patches.append({
+                "path":    leaf,
+                "context": context,
+                "value":   str(new_val),
+            })
+        print(f"  [fallback] Patches to apply: {ai_patches}")
 
     # ------------------------------------------------------------------
-    # 3. Apply patches
+    # Apply patches
     # ------------------------------------------------------------------
-    for p in patches:
-        leaf = str(p.get("path", "")).strip()
-        val  = str(p.get("value", "")).strip()
+    for p in ai_patches:
+        leaf    = str(p.get("path", "")).strip()
+        value   = str(p.get("value", "")).strip()
+        context = str(p.get("context", "")).strip()   # may be absent from Gemini patches
         if not leaf:
             continue
-        if patch_section(sec_lines, leaf, val):
+        if patch_leaf(sec, context, leaf, value):
             modified = True
 
-    # ------------------------------------------------------------------
-    # 4. Rebuild content (preserving original line endings)
-    # ------------------------------------------------------------------
     if modified:
-        lines   = lines[:start] + sec_lines + lines[end:]
+        lines = lines[:start] + sec + lines[end:]
         content = eol.join(lines)
+        # Preserve trailing newline if original had one
         if not content.endswith(eol):
             content += eol
 
@@ -444,63 +376,55 @@ def sync_service(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     api_key  = os.environ.get("GEMINI_API_KEY", "").strip()
     services = os.environ.get("CHANGED_SERVICES", "").strip().split()
-    con_path = os.environ.get(
-        "CONSOLIDATED_VALUES_PATH",
-        "deploy-consolidated/CHART/values.yaml",
-    )
+    con_path = os.environ.get("CONSOLIDATED_VALUES_PATH",
+                              "deploy-consolidated/CHART/values.yaml")
 
     if not services or services == [""]:
-        print("No services detected — nothing to sync.")
+        print("No services detected — done.")
         sys.exit(0)
 
-    mode = "AI + deterministic fallback" if api_key else "deterministic only (no GEMINI_API_KEY)"
-    print(f"Mode             : {mode}")
-    print(f"Services to sync : {services}")
-    print(f"Consolidated path: {con_path}")
+    mode = "Gemini AI + deterministic fallback" if api_key else "deterministic only"
+    print(f"Mode     : {mode}")
+    print(f"Services : {services}")
+    print(f"Chart    : {con_path}")
 
     try:
-        with open(con_path, encoding="utf-8") as fh:
-            content = fh.read()
+        content, eol = read_file(con_path)
     except FileNotFoundError:
-        sys.exit(f"ERROR: consolidated values file not found at '{con_path}'")
+        sys.exit(f"ERROR: {con_path} not found")
 
-    # Detect and preserve original line endings
-    eol = detect_line_ending(content)
-    print(f"Line endings     : {'CRLF' if eol == chr(13)+chr(10) else 'LF'}")
+    print(f"EOL      : {'CRLF' if eol == chr(13)+chr(10) else 'LF'}")
 
     any_modified = False
-    failed_svcs: list[str] = []
+    failed: list[str] = []
 
     for svc in services:
         key = SERVICE_KEY_MAP.get(svc)
         if not key:
-            print(f"\nWARNING: '{svc}' not in SERVICE_KEY_MAP — skipping")
+            print(f"\nWARNING: '{svc}' has no entry in SERVICE_KEY_MAP — skipping")
             continue
         try:
             content, modified = sync_service(svc, key, content, eol, api_key)
             if modified:
                 any_modified = True
         except Exception as exc:
-            print(f"  ERROR processing '{svc}': {exc}")
-            failed_svcs.append(svc)
+            print(f"ERROR syncing '{svc}': {exc}")
+            failed.append(svc)
 
     if any_modified:
-        with open(con_path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
-        print(f"\nUpdated: {con_path}")
+        write_file(con_path, content)
+        print(f"\nWrote: {con_path}")
     else:
-        print("\nNo changes written — consolidated values.yaml is already up to date.")
+        print("\nNo changes — consolidated chart already up to date.")
 
-    if failed_svcs:
-        print(f"\nWARNING: Services with errors (skipped): {failed_svcs}")
-    # Always exit 0 — the workflow diff-check decides if a PR is needed
-    sys.exit(0)
+    if failed:
+        print(f"WARNING: failed services: {failed}")
 
 
 if __name__ == "__main__":
