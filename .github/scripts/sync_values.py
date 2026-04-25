@@ -94,7 +94,7 @@ def call_gemini(prompt: str, api_key: str) -> str:
                 wait = min(BASE_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
                 print(
                     f"  [Gemini] HTTP {resp.status_code} on attempt {attempt}/{MAX_RETRIES}."
-                    f" Retrying in {wait}s …"
+                    f" Retrying in {wait}s ..."
                 )
                 time.sleep(wait)
                 last_exc = Exception(f"HTTP {resp.status_code}")
@@ -117,14 +117,14 @@ def call_gemini(prompt: str, api_key: str) -> str:
                 .get("text", "")
                 .strip()
             )
-            print(f"  [Gemini] OK (attempt {attempt}) — preview: {text[:120]!r}")
+            print(f"  [Gemini] OK (attempt {attempt}) -- preview: {text[:120]!r}")
             return text
 
         except requests.exceptions.Timeout:
             wait = min(BASE_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
             print(
                 f"  [Gemini] Timeout on attempt {attempt}/{MAX_RETRIES}."
-                f" Retrying in {wait}s …"
+                f" Retrying in {wait}s ..."
             )
             time.sleep(wait)
             last_exc = TimeoutError("Gemini request timed out")
@@ -133,7 +133,7 @@ def call_gemini(prompt: str, api_key: str) -> str:
             wait = min(BASE_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
             print(
                 f"  [Gemini] Network error on attempt {attempt}/{MAX_RETRIES}: {exc}."
-                f" Retrying in {wait}s …"
+                f" Retrying in {wait}s ..."
             )
             time.sleep(wait)
             last_exc = exc
@@ -242,10 +242,10 @@ def apply_patch(section_lines: list, path: str, new_value: str) -> list:
             v = f'"{v}"'
 
         section_lines[i] = m.group(1) + v
-        print(f"  Patched [{leaf}]: {cur!r} → {v!r}")
+        print(f"  Patched [{leaf}]: {cur!r} -> {v!r}")
         return section_lines  # one patch per leaf per call
 
-    print(f"  Warning: key '{leaf}' not found in section — patch skipped")
+    print(f"  Warning: key '{leaf}' not found in section -- patch skipped")
     return section_lines
 
 
@@ -265,7 +265,7 @@ def main() -> None:
         sys.exit("ERROR: GEMINI_API_KEY is not set.")
 
     if not services or services == [""]:
-        print("No services detected — nothing to sync.")
+        print("No services detected -- nothing to sync.")
         sys.exit(0)
 
     print(f"Services to sync : {services}")
@@ -283,21 +283,21 @@ def main() -> None:
     for svc in services:
         key = SERVICE_KEY_MAP.get(svc)
         if not key:
-            print(f"\nWARNING: '{svc}' has no entry in SERVICE_KEY_MAP — skipping")
+            print(f"\nWARNING: '{svc}' has no entry in SERVICE_KEY_MAP -- skipping")
             continue
 
         print(f"\n{'='*60}")
-        print(f"Processing : {svc}  →  consolidated key: '{key}'")
+        print(f"Processing : {svc}  ->  consolidated key: '{key}'")
         print(f"{'='*60}")
 
         diff = get_git_diff(svc)
         if not diff:
-            print(f"  No diff found for {svc} — skipping")
+            print(f"  No diff found for {svc} -- skipping")
             continue
 
         start, end = section_bounds(content, key)
         if start is None:
-            print(f"  ERROR: section '{key}' not found in consolidated values.yaml — skipping")
+            print(f"  ERROR: section '{key}' not found in consolidated values.yaml -- skipping")
             failed_svcs.append(svc)
             continue
 
@@ -324,10 +324,10 @@ def main() -> None:
             2. NEVER change a line whose YAML value starts with * (those are YAML anchor aliases).
             3. Do NOT sync values that are intentionally different between the two charts
                (e.g. different ports, different namespaces, different replica counts set for scaling).
-            4. Field names may differ between charts (e.g. replicaCount ↔ replicas, image.tag ↔ tag).
+            4. Field names may differ between charts (e.g. replicaCount <-> replicas, image.tag <-> tag).
             5. Focus primarily on: image tags, replica counts, resource limits/requests, env vars.
 
-            Output format — return ONLY a JSON array, nothing else:
+            Output format -- return ONLY a JSON array, nothing else:
             [{{"path": "dotted.key.path", "value": "new_value"}}]
 
             If there is nothing relevant to sync, return exactly: []
@@ -367,14 +367,13 @@ def main() -> None:
     if modified:
         with open(con_path, "w", encoding="utf-8") as fh:
             fh.write(content)
-        print(f"\n✅  Updated: {con_path}")
+        print(f"\nUpdated: {con_path}")
     else:
-        print("\nℹ️  No changes written — consolidated values.yaml is already up to date.")
+        print("\nNo changes written -- consolidated values.yaml is already up to date.")
 
     if failed_svcs:
-        print(f"\n⚠️  Services with errors (skipped): {failed_svcs}")
-        # Exit 0 so the workflow can still create a PR for the services that DID succeed.
-        # The warnings above make it visible in the Actions log.
+        print(f"\nWARNING: Services with errors (skipped): {failed_svcs}")
+        # Exit 0 so the workflow can still create a PR for services that DID succeed.
 
 
 if __name__ == "__main__":
