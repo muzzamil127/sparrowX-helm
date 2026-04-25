@@ -8,11 +8,11 @@ on:
 
 jobs:
   sync:
-    name: Detect, AI-Sync, and PR
+    name: Detect, Sync, and PR
     runs-on: ubuntu-latest
     permissions:
-      contents: write        # needed to push commits (safety; PAT also handles cross-repo)
-      pull-requests: write   # belt-and-suspenders for gh pr create
+      contents: write
+      pull-requests: write
 
     steps:
       # -----------------------------------------------------------------------
@@ -72,14 +72,15 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.detect.outputs.has_changes == 'true'
-        run: pip install --quiet requests
+        run: pip install --quiet requests pyyaml
 
       # -----------------------------------------------------------------------
-      # 5. Run the Gemini sync script
-      #    continue-on-error: true so the diff-check always runs and we can
-      #    still create a PR for whatever was successfully patched.
+      # 5. Run the sync script
+      #    Primary: deterministic YAML-diff (no API needed, always works)
+      #    Optional: Gemini for unmapped fields when GEMINI_API_KEY is set
+      #    continue-on-error keeps the diff-check running even on unexpected crash
       # -----------------------------------------------------------------------
-      - name: Run Gemini sync script
+      - name: Run sync script
         if: steps.detect.outputs.has_changes == 'true'
         id: sync_script
         continue-on-error: true
@@ -145,8 +146,9 @@ jobs:
 
           ### What happened
           1. A developer pushed a change to \`values.yaml\` in **sparrowX-helm**.
-          2. Gemini AI identified fields to mirror to the consolidated chart.
-          3. Only fields with a clear equivalent were updated; YAML anchors and comments preserved.
+          2. The sync script detected changed fields via YAML diff (deterministic, no AI required).
+          3. Common fields (image.tag, replicas, resources) were synced automatically.
+          4. YAML anchors and comments are preserved.
 
           > Please review the diff carefully before merging.
 

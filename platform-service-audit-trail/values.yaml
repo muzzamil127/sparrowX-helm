@@ -9,7 +9,7 @@ image:
   repository: devopstps/platform-service-audit-trail
   pullPolicy: IfNotPresent
   # Override with image digest or tag at deploy time, e.g. --set image.tag=sha-abc123
-  tag: "v0.1.2.3.4.4.4.4.4.4"
+  tag: "v0.1.2.3.4.4.4.4.4.5"
 
 nameOverride: ""
 fullnameOverride: ""
